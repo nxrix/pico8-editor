@@ -1114,9 +1114,9 @@ function _update()
 end
 
 function _draw()
-  cls(1)
-  print("hello world", 42, 56, 7)
-  print("frame " .. t, 46, 72, 6)
+  cls()
+  local s = "hello world "..t;
+  print(s,64-#s*2,64-2,7)
 end
 `
 ;(() => {
