@@ -1,0 +1,1128 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>p8 cart studio</title>
+<style>img,canvas{image-rendering:pixelated}</style>
+</head>
+<body>
+<iframe id="player" width="256" height="256" frameborder="0" scrolling="no" allow="autoplay; fullscreen; gamepad"></iframe>
+<div>
+<button id="pp">pause</button>
+<button id="mute">mute</button>
+<button id="reset">reset</button>
+<button id="fs">fullscreen</button>
+</div>
+<div>
+<button id="load">load</button>
+<button id="save">save</button>
+<button id="run">run</button>
+<button id="cap">capture label</button>
+</div>
+<textarea id="code" rows="16" cols="64" spellcheck="false"></textarea>
+<br>
+<img id="cart" alt="cart png">
+<br>
+<img id="gfx" alt="gfx png" width="256" height="256">
+<br>
+<img id="map" alt="map png" width="512" height="256">
+<input id="file" type="file" accept=".png" hidden>
+<script>
+"use strict"
+
+const PALETTE = [
+  [0, 0, 0], [29, 43, 83], [126, 37, 83], [0, 135, 81], [171, 82, 54], [95, 87, 79],
+  [194, 195, 199], [255, 241, 232], [255, 0, 77], [255, 163, 0], [255, 236, 39], [0, 228, 54],
+  [41, 173, 255], [131, 118, 156], [255, 119, 168], [255, 204, 170],
+]
+
+const OFF = { gfx: 0x0000, map: 0x2000, gff: 0x3000, music: 0x3100, sfx: 0x3200, code: 0x4300, version: 0x8000 }
+const SIZE = { gfx: 0x2000, map: 0x1000, gff: 0x0100, music: 0x0100, sfx: 0x1100, code: 0x3d00 }
+const PNG_W = 160
+const PNG_H = 205
+const LABEL_Y = 24
+const VERSION = 33
+const FUTURE1 = "if(_update60)_update=function()_update60()_update60()end"
+const FUTURE2 = "if(_update60)_update=function()_update60()_update_buttons()_update60()end"
+
+const KANA = "あいうえおかきくけこさしすせそたちつてとなにぬねのはひふへほまみむめもやゆよらりるれろわをんっゃゅょアイウエオカキクケコサシスセソタチツテトナニヌネノハヒフヘホマミムメモヤユヨラリルレロワヲンッャュョ"
+const P8SCII = {
+  16: "▮", 17: "■", 18: "□", 19: "⁙", 20: "⁘", 21: "‖", 22: "◀", 23: "▶", 24: "「", 25: "」",
+  26: "¥", 27: "•", 28: "、", 29: "。", 30: "゛", 31: "゜", 127: "○", 128: "█", 129: "▒", 130: "🐱",
+  131: "⬇️", 132: "░", 133: "✽", 134: "●", 135: "♥", 136: "☉", 137: "웃", 138: "⌂", 139: "⬅️", 140: "😐",
+  141: "♪", 142: "🇾️", 143: "◆", 144: "…", 145: "➡️", 146: "★", 147: "⧗", 148: "⬆️", 149: "ˇ", 150: "∧",
+  151: "❎", 152: "▤", 153: "▥", 254: "◜", 255: "◝",
+}
+for (let i = 0; i < KANA.length; i++) P8SCII[154 + i] = KANA[i]
+const UNI_TO_P8SCII = new Map(Object.entries(P8SCII).map(([k, v]) => [v, +k]))
+
+const bytesToStr = bytes => {
+  let s = ""
+  for (let i = 0; i < bytes.length; i++) s += P8SCII[bytes[i]] ?? String.fromCharCode(bytes[i])
+  return s
+}
+
+const strToBytes = s => {
+  const out = new Uint8Array(s.length * 2)
+  let n = 0
+  let i = 0
+  while (i < s.length) {
+    let hit = false
+    for (let l = 3; l >= 1 && !hit; l--) {
+      if (i + l <= s.length && UNI_TO_P8SCII.has(s.slice(i, i + l))) {
+        out[n++] = UNI_TO_P8SCII.get(s.slice(i, i + l))
+        i += l
+        hit = true
+      }
+    }
+    if (hit) continue
+    const c = s.charCodeAt(i)
+    out[n++] = c < 256 ? c : 63
+    i++
+  }
+  return out.subarray(0, n)
+}
+
+const PXA_MIN_BLOCK = 3
+const PXA_LEN_CHAIN_BITS = 3
+const PXA_DIST_BITS = 5
+const PXA_TINY_BITS = 4
+const PXA_HASH_MAX = 4096
+
+const pxaCompress = src => {
+  const len = src.length
+  if (len === 0) return null
+  const hashLists = new Array(PXA_HASH_MAX)
+  for (let i = 0; i < len - 2; i++) {
+    const h = (src[i] * 7 + src[i + 1] * 1503 + src[i + 2] * 51717) & (PXA_HASH_MAX - 1)
+    ;(hashLists[h] || (hashLists[h] = [])).push(i)
+  }
+  const dest = new Uint8Array(len * 2 + 1024)
+  let destPos = 0
+  let bit = 1
+  const putbit = v => {
+    dest[destPos] = (dest[destPos] & ~bit) | (v ? bit : 0)
+    bit <<= 1
+    if (bit === 256) { bit = 1; destPos++ }
+  }
+  const putval = (v, bits) => {
+    for (let q = 0; q < bits; q++) putbit(v & (1 << q))
+    return bits
+  }
+  const putchain = (v, linkBits, maxBits) => {
+    const maxLink = (1 << linkBits) - 1
+    let written = 0
+    let vv = maxLink
+    while (vv === maxLink) {
+      vv = Math.min(v, maxLink)
+      written += putval(vv, linkBits)
+      v -= vv
+      if (written >= maxBits) return written
+    }
+    return written
+  }
+  const putnum = v => {
+    let bits = PXA_DIST_BITS
+    while ((1 << bits) <= v) bits += PXA_DIST_BITS
+    putchain(3 - (bits / PXA_DIST_BITS), 1, 2)
+    putval(v, bits)
+  }
+  const writePos = () => (destPos << 16) | (dest[destPos] << 8) | bit
+  const setWritePos = v => {
+    bit = v & 0xff
+    destPos = (v >> 16) & 0x7fff
+  }
+  const literal = new Int32Array(256)
+  const literalPos = new Int32Array(256)
+  const literalBak = new Int32Array(256)
+  const literalPosBak = new Int32Array(256)
+  for (let m = 0; m < 256; m++) { literal[m] = m; literalPos[m] = m }
+  const backup = () => { literalBak.set(literal); literalPosBak.set(literalPos) }
+  const restore = () => { literal.set(literalBak); literalPos.set(literalPosBak) }
+  const findBlock = pos => {
+    const maxLen = len - pos
+    if (maxLen < PXA_MIN_BLOCK) return [0, 0, -1]
+    const h = (src[pos] * 7 + src[pos + 1] * 1503 + src[pos + 2] * 51717) & (PXA_HASH_MAX - 1)
+    const list = hashLists[h]
+    if (!list) return [0, 0, -1]
+    let bestLen = 0
+    let bestPos0 = -100000
+    let bestScore = -1
+    for (let lp = 0; lp < list.length && list[lp] < pos; lp++) {
+      const pos0 = list[lp]
+      if (pos0 < pos - 32767) continue
+      let n = 0
+      while (n < maxLen && pos0 + n < pos && src[pos0 + n] === src[pos + n]) n++
+      while (n < maxLen && pos0 + n >= pos && src[pos0 + (n % (pos - pos0))] === src[pos + n]) n++
+      let cost = 0
+      for (let d = pos - pos0; d > 0; d >>= PXA_DIST_BITS) cost++
+      cost = Math.min(cost, 2) + cost * PXA_DIST_BITS + 4
+      const score = Math.floor(n * 256 / cost)
+      if (score > bestScore) { bestScore = score; bestPos0 = pos0; bestLen = n }
+    }
+    return [bestLen, bestPos0 >= 0 ? pos - bestPos0 : 0, bestScore]
+  }
+  putval(0, 8)
+  putval(0x70, 8)
+  putval(0x78, 8)
+  putval(0x61, 8)
+  putval((len >> 8) & 255, 8)
+  putval(len & 255, 8)
+  putval(0, 8)
+  putval(0, 8)
+  let pos = 0
+  let rawPosDest = destPos
+  let rawPosSrc = pos
+  let rawPosSrc0 = pos
+  let rawHeaderPos = writePos()
+  let rawBlockPos = writePos()
+  let storedRaw = 0
+  backup()
+  while (pos < len) {
+    const [blockLen0, blockOffset, blockScore0] = findBlock(pos)
+    let blockScore = blockScore0
+    const c = src[pos]
+    const lpos = literalPos[c]
+    let catBits = PXA_TINY_BITS
+    let catMax = 1 << catBits
+    while (lpos >= catMax) { catBits++; catMax += 1 << catBits }
+    const literalScore = Math.floor(256 / (2 + (catBits - PXA_TINY_BITS) + catBits))
+    if (blockLen0 >= PXA_MIN_BLOCK && blockScore > literalScore && blockScore < 128) {
+      for (let ii = 1; ii < 3; ii++) {
+        const fb2 = findBlock(pos + ii)
+        if (fb2[2] > Math.floor(blockScore * 6 / 5)) { blockScore = 0; break }
+      }
+    }
+    if (blockLen0 >= PXA_MIN_BLOCK && blockScore > literalScore) {
+      putbit(0)
+      putnum(blockOffset - 1)
+      putchain(blockLen0 - PXA_MIN_BLOCK, PXA_LEN_CHAIN_BITS, 100000)
+      pos += blockLen0
+    } else {
+      putbit(1)
+      let cb = PXA_TINY_BITS
+      let cm = 1 << cb
+      let val = lpos
+      while (lpos >= cm) { val -= 1 << cb; cb++; cm += 1 << cb }
+      putchain(cb - PXA_TINY_BITS, 1, 16)
+      putval(val, cb)
+      for (let mi = lpos; mi > 0; mi--) { literal[mi] = literal[mi - 1]; literalPos[literal[mi]]++ }
+      literal[0] = c
+      literalPos[c] = 0
+      pos++
+    }
+    if (destPos - rawPosDest >= 32 || pos === len) {
+      const compSize = destPos - rawPosDest
+      const rawSize = pos - rawPosSrc
+      const margin = rawPosSrc0 === rawPosSrc ? 3 : 0
+      if (compSize > rawSize + margin) {
+        if (storedRaw === 0) {
+          setWritePos(rawHeaderPos)
+          putbit(0)
+          putbit(1)
+          putbit(0)
+          putval(0, 10)
+        } else {
+          setWritePos(rawBlockPos)
+          destPos--
+        }
+        for (let k = 0; k < rawSize; k++) putval(src[rawPosSrc + k], 8)
+        putval(0, 8)
+        storedRaw = 1
+        restore()
+      } else {
+        storedRaw = 0
+        rawPosSrc0 = pos
+        backup()
+      }
+      rawPosDest = destPos
+      rawPosSrc = pos
+      rawBlockPos = writePos()
+    }
+  }
+  while (bit !== 1) putbit(0)
+  const written = destPos
+  dest[6] = (written >> 8) & 255
+  dest[7] = written & 255
+  if (written > len) return null
+  return dest.subarray(0, written)
+}
+
+const pxaDecompress = region => {
+  const rawLen = (region[4] << 8) | region[5]
+  const compLen = (region[6] << 8) | region[7]
+  const out = new Uint8Array(Math.max(rawLen, 1) + 1)
+  let srcPos = 8
+  let bit = 1
+  let destPos = 0
+  const getbit = () => {
+    if (srcPos >= region.length) return 0
+    const v = (region[srcPos] & bit) ? 1 : 0
+    bit <<= 1
+    if (bit === 256) { bit = 1; srcPos++ }
+    return v
+  }
+  const getval = bits => {
+    let v = 0
+    for (let q = 0; q < bits; q++) if (getbit()) v |= 1 << q
+    return v
+  }
+  const getchain = (linkBits, maxBits) => {
+    const maxLink = (1 << linkBits) - 1
+    let val = 0
+    let vv = maxLink
+    let read = 0
+    while (vv === maxLink) {
+      vv = getval(linkBits)
+      read += linkBits
+      val += vv
+      if (read >= maxBits) return val
+    }
+    return val
+  }
+  const getnum = () => {
+    const bits = (3 - getchain(1, 2)) * PXA_DIST_BITS
+    const v = getval(bits)
+    return v === 0 && bits === 10 ? -1 : v
+  }
+  const literal = new Int32Array(256)
+  const literalPos = new Int32Array(256)
+  for (let m = 0; m < 256; m++) { literal[m] = m; literalPos[m] = m }
+  while (srcPos < compLen && destPos < rawLen) {
+    if (getbit() === 0) {
+      const offset = getnum() + 1
+      if (offset === 0) {
+        while (destPos < rawLen) {
+          const ch = getval(8)
+          out[destPos] = ch
+          if (ch === 0) break
+          destPos++
+        }
+      } else {
+        let blockLen = getchain(PXA_LEN_CHAIN_BITS, 100000) + PXA_MIN_BLOCK
+        while (blockLen > 0 && destPos < out.length) {
+          out[destPos] = out[destPos - offset]
+          destPos++
+          blockLen--
+        }
+        if (destPos < out.length - 1) out[destPos] = 0
+      }
+    } else {
+      let lpos = 0
+      let bits = 0
+      let safety = 0
+      while (getbit() === 1 && safety++ < 16) { lpos += 1 << (PXA_TINY_BITS + bits); bits++ }
+      bits += PXA_TINY_BITS
+      lpos += getval(bits)
+      if (lpos > 255) break
+      const c = literal[lpos]
+      out[destPos++] = c
+      if (destPos < out.length) out[destPos] = 0
+      for (let mi = lpos; mi > 0; mi--) { literal[mi] = literal[mi - 1]; literalPos[literal[mi]]++ }
+      literal[0] = c
+      literalPos[c] = 0
+    }
+  }
+  return { code: out.subarray(0, Math.min(rawLen, destPos)), rawLen }
+}
+
+const CHAR_TABLE = "#\n 0123456789abcdefghijklmnopqrstuvwxyz!#%(){}[]<>+=/*:;.,~_"
+const endsWithBytes = (arr, str) => {
+  if (arr.length < str.length) return false
+  for (let i = 0; i < str.length; i++) if (arr[arr.length - str.length + i] !== str.charCodeAt(i)) return false
+  return true
+}
+
+const legacyCodeFromRegion = region => {
+  const codeLen = (region[4] << 8) | region[5]
+  const out = new Uint8Array(Math.max(codeLen, 1))
+  let outI = 0
+  let inI = 8
+  while (outI < codeLen && inI < region.length) {
+    if (region[inI] === 0) {
+      inI++
+      out[outI++] = region[inI]
+    } else if (region[inI] <= 0x3b) {
+      out[outI++] = CHAR_TABLE.charCodeAt(region[inI])
+    } else {
+      inI++
+      const offset = (region[inI - 1] - 0x3c) * 16 + (region[inI] & 0x0f)
+      const length = (region[inI] >> 4) + 2
+      out.copyWithin(outI, outI - offset, outI - offset + length)
+      outI += length
+    }
+    inI++
+  }
+  let s = 0
+  let e = outI
+  while (s < e && out[s] === 0) s++
+  while (e > s && out[e - 1] === 0) e--
+  let code = out.slice(s, e)
+  for (const suffix of [FUTURE1, FUTURE2]) {
+    if (endsWithBytes(code, suffix)) {
+      code = code.slice(0, code.length - suffix.length)
+      if (code.length && code[code.length - 1] === 10) code = code.slice(0, code.length - 1)
+    }
+  }
+  return { code, compressedSize: inI }
+}
+
+const codeFromRegion = region => {
+  if (region[0] === 0 && region[1] === 0x70 && region[2] === 0x78 && region[3] === 0x61) {
+    const px = pxaDecompress(region)
+    return { code: bytesToStr(px.code), compressed: true, compressedSize: (region[6] << 8) | region[7], format: "pxa" }
+  }
+  if (region[0] === 0x3a && region[1] === 0x63 && region[2] === 0x3a && region[3] === 0) {
+    const c = legacyCodeFromRegion(region)
+    return { code: bytesToStr(c.code), compressed: true, compressedSize: c.compressedSize, format: "c" }
+  }
+  const end = region.indexOf(0)
+  const size = end < 0 ? region.length : end
+  return { code: bytesToStr(region.subarray(0, size)), compressed: false, compressedSize: size, format: "raw" }
+}
+
+const codeToRegion = codeStr => {
+  const raw = strToBytes(codeStr ?? "")
+  const region = new Uint8Array(SIZE.code)
+  if (!raw.length) return region
+  const comp = pxaCompress(raw)
+  region.set(comp && comp.length <= raw.length ? comp : raw.subarray(0, Math.min(raw.length, SIZE.code)))
+  return region
+}
+
+const sha1 = bytes => {
+  const ml = bytes.length
+  const padded = new Uint8Array((((ml + 8) >> 6) + 1) << 6)
+  padded.set(bytes)
+  padded[ml] = 0x80
+  const dv = new DataView(padded.buffer)
+  dv.setUint32(padded.length - 4, ml << 3, false)
+  let h0 = 0x67452301, h1 = 0xefcdab89, h2 = 0x98badcfe, h3 = 0x10325476, h4 = 0xc3d2e1f0
+  const w = new Int32Array(80)
+  const rol = (v, n) => ((v << n) | (v >>> (32 - n))) | 0
+  for (let block = 0; block < padded.length; block += 64) {
+    for (let i = 0; i < 16; i++) w[i] = dv.getInt32(block + i * 4, false)
+    for (let i = 16; i < 80; i++) w[i] = rol(w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16], 1)
+    let a = h0, b = h1, c = h2, d = h3, e = h4
+    for (let i = 0; i < 80; i++) {
+      let f, k
+      if (i < 20) { f = (b & c) | (~b & d); k = 0x5a827999 }
+      else if (i < 40) { f = b ^ c ^ d; k = 0x6ed9eba1 }
+      else if (i < 60) { f = (b & c) | (b & d) | (c & d); k = 0x8f1bbcdc }
+      else { f = b ^ c ^ d; k = 0xca62c1d6 }
+      const temp = (rol(a, 5) + f + e + k + w[i]) | 0
+      e = d; d = c; c = rol(b, 30); b = a; a = temp
+    }
+    h0 = (h0 + a) | 0; h1 = (h1 + b) | 0; h2 = (h2 + c) | 0; h3 = (h3 + d) | 0; h4 = (h4 + e) | 0
+  }
+  const out = new Uint8Array(20)
+  const odv = new DataView(out.buffer)
+  odv.setUint32(0, h0 >>> 0, false)
+  odv.setUint32(4, h1 >>> 0, false)
+  odv.setUint32(8, h2 >>> 0, false)
+  odv.setUint32(12, h3 >>> 0, false)
+  odv.setUint32(16, h4 >>> 0, false)
+  return out
+}
+
+const CRC_TABLE = (() => {
+  const t = new Uint32Array(256)
+  for (let n = 0; n < 256; n++) {
+    let c = n
+    for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ c >>> 1 : c >>> 1
+    t[n] = c >>> 0
+  }
+  return t
+})()
+
+const crc32 = buf => {
+  let c = 0xffffffff
+  for (let i = 0; i < buf.length; i++) c = CRC_TABLE[(c ^ buf[i]) & 255] ^ c >>> 8
+  return (c ^ 0xffffffff) >>> 0
+}
+
+const adler32 = buf => {
+  let a = 1, b = 0
+  for (let i = 0; i < buf.length; i++) { a = (a + buf[i]) % 65521; b = (b + a) % 65521 }
+  return ((b << 16) | a) >>> 0
+}
+
+const pngChunk = (type, data) => {
+  const out = new Uint8Array(12 + data.length)
+  const dv = new DataView(out.buffer)
+  dv.setUint32(0, data.length)
+  for (let i = 0; i < 4; i++) out[4 + i] = type.charCodeAt(i)
+  out.set(data, 8)
+  dv.setUint32(8 + data.length, crc32(out.subarray(4, 8 + data.length)))
+  return out
+}
+
+const encodePng = (pixels, w, h) => {
+  const stride = w * 4 + 1
+  const raw = new Uint8Array(stride * h)
+  for (let y = 0; y < h; y++) raw.set(pixels.subarray(y * w * 4, (y + 1) * w * 4), y * stride + 1)
+  const nBlocks = Math.ceil(raw.length / 65535) || 1
+  const z = new Uint8Array(2 + raw.length + nBlocks * 5 + 4)
+  z[0] = 0x78
+  z[1] = 0x01
+  let p = 2
+  let off = 0
+  for (let b = 0; b < nBlocks; b++) {
+    const len = Math.min(65535, raw.length - off)
+    z[p] = b === nBlocks - 1 ? 1 : 0
+    z[p + 1] = len & 255
+    z[p + 2] = len >> 8
+    z[p + 3] = ~len & 255
+    z[p + 4] = (~len >> 8) & 255
+    z.set(raw.subarray(off, off + len), p + 5)
+    p += 5 + len
+    off += len
+  }
+  const ad = adler32(raw)
+  z[p] = ad >>> 24 & 255
+  z[p + 1] = ad >>> 16 & 255
+  z[p + 2] = ad >>> 8 & 255
+  z[p + 3] = ad & 255
+  const ihdr = new Uint8Array(13)
+  const dv = new DataView(ihdr.buffer)
+  dv.setUint32(0, w)
+  dv.setUint32(4, h)
+  ihdr[8] = 8
+  ihdr[9] = 6
+  const parts = [
+    new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]),
+    pngChunk("IHDR", ihdr),
+    pngChunk("IDAT", z.subarray(0, p + 4)),
+    pngChunk("IEND", new Uint8Array(0)),
+  ]
+  const out = new Uint8Array(parts.reduce((n, part) => n + part.length, 0))
+  let o = 0
+  for (const part of parts) { out.set(part, o); o += part.length }
+  return out
+}
+
+const decodePng = async bytes => {
+  if (bytes[0] !== 0x89 || bytes[1] !== 0x50) throw new Error("not a png file")
+  const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength)
+  let pos = 8
+  let w = 0, h = 0, bitDepth = 8, colorType = 6, interlace = 0
+  let plte = null, trns = null
+  const idat = []
+  while (pos + 8 <= bytes.length) {
+    const len = dv.getUint32(pos)
+    const type = String.fromCharCode(bytes[pos + 4], bytes[pos + 5], bytes[pos + 6], bytes[pos + 7])
+    const data = bytes.subarray(pos + 8, pos + 8 + len)
+    if (type === "IHDR") {
+      const hd = new DataView(data.buffer, data.byteOffset, data.byteLength)
+      w = hd.getUint32(0)
+      h = hd.getUint32(4)
+      bitDepth = data[8]
+      colorType = data[9]
+      interlace = data[12]
+    } else if (type === "PLTE") plte = data.slice()
+    else if (type === "tRNS") trns = data.slice()
+    else if (type === "IDAT") idat.push(data)
+    else if (type === "IEND") break
+    pos += 12 + len
+  }
+  if (!w || !h) throw new Error("bad png header")
+  if (bitDepth !== 8) throw new Error(`unsupported bit depth ${bitDepth}`)
+  if (interlace) throw new Error("interlaced png not supported")
+  const bpp = colorType === 6 ? 4 : colorType === 2 ? 3 : colorType === 3 ? 1 : 0
+  if (!bpp) throw new Error(`unsupported color type ${colorType}`)
+  const z = new Uint8Array(idat.reduce((n, c) => n + c.length, 0))
+  let o = 0
+  for (const c of idat) { z.set(c, o); o += c.length }
+  const raw = new Uint8Array(await new Response(new Blob([z]).stream().pipeThrough(new DecompressionStream("deflate"))).arrayBuffer())
+  const stride = w * bpp
+  if (raw.length < (stride + 1) * h) throw new Error("png data too short")
+  const out = new Uint8Array(w * h * 4)
+  let prev = new Uint8Array(stride)
+  const paeth = (a, b, c) => {
+    const p = a + b - c
+    const pa = Math.abs(p - a)
+    const pb = Math.abs(p - b)
+    const pc = Math.abs(p - c)
+    return pa <= pb && pa <= pc ? a : pb <= pc ? b : c
+  }
+  for (let y = 0; y < h; y++) {
+    const f = raw[y * (stride + 1)]
+    const line = raw.subarray(y * (stride + 1) + 1, y * (stride + 1) + 1 + stride)
+    const cur = new Uint8Array(stride)
+    for (let x = 0; x < stride; x++) {
+      const a = x >= bpp ? cur[x - bpp] : 0
+      const b = prev[x]
+      const c = x >= bpp ? prev[x - bpp] : 0
+      let v = line[x]
+      if (f === 1) v = (v + a) & 255
+      else if (f === 2) v = (v + b) & 255
+      else if (f === 3) v = (v + ((a + b) >> 1)) & 255
+      else if (f === 4) v = (v + paeth(a, b, c)) & 255
+      cur[x] = v
+    }
+    for (let x = 0; x < w; x++) {
+      const dst = (y * w + x) * 4
+      const s = x * bpp
+      if (colorType === 6) {
+        out[dst] = cur[s]
+        out[dst + 1] = cur[s + 1]
+        out[dst + 2] = cur[s + 2]
+        out[dst + 3] = cur[s + 3]
+      } else if (colorType === 2) {
+        out[dst] = cur[s]
+        out[dst + 1] = cur[s + 1]
+        out[dst + 2] = cur[s + 2]
+        out[dst + 3] = 255
+      } else {
+        const idx = cur[s]
+        out[dst] = plte ? plte[idx * 3] : 0
+        out[dst + 1] = plte ? plte[idx * 3 + 1] : 0
+        out[dst + 2] = plte ? plte[idx * 3 + 2] : 0
+        out[dst + 3] = trns && idx < trns.length ? trns[idx] : 255
+      }
+    }
+    prev = cur
+  }
+  return { w, h, pixels: out }
+}
+
+const newLabel = () => new Uint8Array(0x2800)
+
+const labelGet = (lab, x, y) => {
+  const b = lab[y * 80 + (x >> 1)]
+  return x & 1 ? b >> 4 : b & 15
+}
+
+const labelSet = (lab, x, y, c) => {
+  const i = y * 80 + (x >> 1)
+  const b = lab[i]
+  lab[i] = x & 1 ? (b & 15) | (c << 4) : (b & 0xf0) | (c & 15)
+}
+
+const nearestPalette = (r, g, b) => {
+  let best = 0
+  let bd = Infinity
+  for (let i = 0; i < 16; i++) {
+    const dr = PALETTE[i][0] - r
+    const dg = PALETTE[i][1] - g
+    const db = PALETTE[i][2] - b
+    const d = dr * dr + dg * dg + db * db
+    if (d < bd) { bd = d; best = i }
+  }
+  return best
+}
+
+const SHELL_GRAY = [100,100,100]
+const PANEL_BLUE = [52,52,52]
+const TITLE_WHITE = [252,248,240]
+const FRAME_BLACK = [0,4,8]
+
+const transparent = (x, y) =>
+  (y < 3 && (x < 3 - y || x > 156 + y)) || (y > 194 && x >= 354 - y) || (y > 201 && x < y - 201)
+
+const SHELL_B64 = "A2RkaJoABAgFZGRoAQAECJpkZGQBAAQIA2RkaAEABAicZGRkAQAECAFkZGgBAAQInmRkZAIABAieZGRkAgAECJ5kZGQCAAQILmRkZAH8AExvZGRkAgAECC1kZGQB/JgAAfzw6AH8zLxuZGRkAgAECCxkZGQB/OQkA/zw6AH8dKhtZGRkAgAECC1kZGQBAOAwAfzw6AGEcKhuZGRkAgAECA9kZGQE/PDoAWRkZAT88OgCZGRkA/zw6AJkZGQE/PDoBWRkZAT88OgCZGRkASis/C5kZGQBsKikAWRkZAGwqKQBZGRkAbCopAFkZGQBsKikAWRkZAGwqKQBZGRkAbCopANkZGQDsKikAWRkZAOwqKQCZGRkArCopAJkZGQCsKikBWRkZAOwqKQEZGRkArCopAJkZGQCsKikAWRkZAOwqKQOZGRkAgAECA5kZGQC/PDoAWRkZAL88OgCZGRkAvzw6AJkZGQC/PDoA2RkZAL88OgBZGRkAvzw6AVkZGQB/PDoAmRkZAH88OgxZGRkAbCopAFkZGQBsKikAWRkZAGwqKQBZGRkAbCopAFkZGQBsKikAWRkZAGwqKQDZGRkAbCopAFkZGQBsKikAmRkZAGwqKQCZGRkAbCopANkZGQBsKikAWRkZAGwqKQFZGRkAbCopAFkZGQBsKikA2RkZAGwqKQDZGRkAbCopAFkZGQBsKikAWRkZAOwqKQOZGRkAgAECA5kZGQF/PDoAmRkZAL88OgCZGRkAvzw6ANkZGQC/PDoAWRkZAL88OgBZGRkAvzw6AFkZGQF/PDoMWRkZAGwqKQBZGRkAbCopAFkZGQBsKikAWRkZAGwqKQBZGRkAbCopAFkZGQBsKikA2RkZAOwqKQCZGRkAbCopAJkZGQBsKikA2RkZAGwqKQBZGRkAbCopAFkZGQDsKikAWRkZAOwqKQDZGRkAbCopANkZGQBsKikAWRkZAGwqKQBZGRkAbCopAFkZGQBsKikDmRkZAIABAgOZGRkAvzw6AVkZGQC/PDoAmRkZAL88OgDZGRkAvzw6AFkZGQC/PDoBGRkZAL88OgCZGRkAfzw6DFkZGQDsKikAWRkZAOwqKQBZGRkA7CopANkZGQBsKikBGRkZAGwqKQCZGRkAbCopANkZGQBsKikAWRkZAGwqKQFZGRkAbCopAFkZGQBsKikA2RkZAGwqKQDZGRkAbCopAFkZGQBsKikAWRkZAGwqKQBZGRkAbCopA5kZGQCAAQIDmRkZAL88OgEZGRkBPzw6AFkZGQE/PDoAWRkZAT88OgFZGRkBfzw6DFkZGQDsKikAWRkZAOwqKQBZGRkA7CopAFkZGQBsKikAWRkZAGwqKQDZGRkA7CopAJkZGQCsKikAWRkZAKwqKQGZGRkA7CopAFkZGQBsKikAmRkZAKwqKQBZGRkArCopAJkZGQBsKikAWRkZAGwqKQOZGRkAgAECJ5kZGQCAAQInmRkZAIABAieZGRkAgAECJ5kZGQCAAQInmRkZAIABAieZGRkAgAECJ5kZGQCAAQInmRkZAIABAgOZGRkggAECA5kZGQCAAQIDmRkZIIABAgOZGRkAgAECJ5kZGQCAAQInmRkZAIABAieZGRkAgAECJ5kZGQCAAQInmRkZAIABAieZGRkAgAECJ5kZGQCAAQInmRkZAIABAieZGRkAgAECJ5kZGQCAAQIDmRkZII0NDQOZGRkAgAECA5kZGSCNDQ0DmRkZAIABAgOZGRkgjQ0NA5kZGQCAAQIDmRkZII0NDQOZGRkAgAECA5kZGSCNDQ0DmRkZAIABAgOZGRkgjQ0NA5kZGQCAAQIDmRkZII0NDQOZGRkAgAECA5kZGSCNDQ0DmRkZAIABAgOZGRkgjQ0NA5kZGQCAAQIDmRkZII0NDQOZGRkAgAECA5kZGSCNDQ0DmRkZAIABAgOZGRkgjQ0NA5kZGQCAAQIDmRkZII0NDQOZGRkAgAECA5kZGSCNDQ0DmRkZAIABAgOZGRkgjQ0NA5kZGQCAAQIDmRkZII0NDQOZGRkAgAECA5kZGSCNDQ0DmRkZAIABAgOZGRkgjQ0NA5kZGQCAAQIDmRkZII0NDQOZGRkAgAECA5kZGSCNDQ0DmRkZAIABAgOZGRkgjQ0NA5kZGQCAAQIDmRkZII0NDQOZGRkAgAECA5kZGSCNDQ0DmRkZAIABAgOZGRkgjQ0NA5kZGQCAAQIDmRkZAM0NDQDoKCgATQ0NAOgoKACNDQ0AqCgoAI0NDQCoKCgBTQ0NAOgoKAGNDQ0AqCgoAE0NDQDoKCgATQ0NAOgoKABNDQ0A6CgoAE0NDQDoKCgATQ0NAOgoKABNDQ0AqCgoAM0NDQCoKCgATQ0NAOgoKBANDQ0DmRkZAIABAgOZGRkAzQ0NAGgoKABNDQ0AaCgoAI0NDQBoKCgAjQ0NAGgoKADNDQ0AaCgoAE0NDQBoKCgBTQ0NAGgoKABNDQ0AaCgoAU0NDQBoKCgAzQ0NAGgoKABNDQ0AaCgoAE0NDQBoKCgATQ0NAGgoKACNDQ0AaCgoAI0NDQBoKCgATQ0NAGgoKACNDQ0AaCgoAI0NDQBoKCgATQ0NAGgoKABNDQ0AaCgoAM0NDQBoKCgQjQ0NA5kZGQCAAQIDmRkZAM0NDQDoKCgAjQ0NAGgoKACNDQ0AaCgoAM0NDQBoKCgATQ0NAGgoKABNDQ0A6CgoAE0NDQDoKCgBTQ0NAGgoKADNDQ0A6CgoAE0NDQCoKCgAzQ0NAGgoKACNDQ0AqCgoAM0NDQBoKCgAjQ0NAGgoKABNDQ0AaCgoAE0NDQBoKCgAzQ0NAKgoKBBNDQ0DmRkZAIABAgOZGRkAzQ0NAGgoKAENDQ0AaCgoAI0NDQBoKCgAzQ0NAGgoKABNDQ0AaCgoAU0NDQBoKCgATQ0NAGgoKAFNDQ0AaCgoAM0NDQBoKCgATQ0NAGgoKABNDQ0AaCgoAE0NDQBoKCgAjQ0NAGgoKACNDQ0AaCgoAE0NDQBoKCgAjQ0NAGgoKACNDQ0AaCgoAE0NDQBoKCgATQ0NAGgoKABNDQ0AaCgoAE0NDQBoKCgQjQ0NA5kZGQCAAQIDmRkZAM0NDQBoKCgAzQ0NAOgoKACNDQ0AqCgoAE0NDQCoKCgBjQ0NAOgoKAGNDQ0AqCgoAE0NDQBoKCgATQ0NAGgoKABNDQ0AaCgoAE0NDQBoKCgAjQ0NAGgoKACNDQ0AaCgoAE0NDQBoKCgATQ0NAOgoKABNDQ0A6CgoAE0NDQDoKCgATQ0NAOgoKBANDQ0DmRkZAIABAgOZGRkgjQ0NA5kZGQCAAQIDmRkZII0NDQOZGRkAgAECA5kZGSCNDQ0DmRkZAIABAidZGRkAQAECAFkZGgBAAQInGRkZAEABAgCZGRoAQAECJtkZGQBAAQIA2RkaAEABAiaZGRkAQAECARkZGgBAAQImWRkZAEABAgFZGRoAQAECJhkZGQBAAQIBmRkaAEABAiXZGRkAQAECAhkZGgBAAQIlWRkZAEABAgKZGRoAQAECJNkZGQBAAQIDGRkaJMABAgKZGRo"
+const FONT = ["000000", "020222", "000055", "057575", "027637", "051245", "075633", "000012", "021112", "024442", "052725", "002720", "012000", "000700", "020000", "012224", "075557", "072223", "071747", "074647", "044755", "074717", "075711", "044447", "075757", "044757", "002020", "012020", "042124", "007070", "012421", "020647", "061552", "057560", "075330", "061160", "035530", "061370", "011370", "075160", "057550", "072270", "032270", "055350", "061110", "055770", "055530", "035560", "017560", "063520", "053530", "034160", "022270", "065550", "027550", "077550", "052250", "034750", "071470", "031113", "042221", "064446", "000052", "070000", "000042", "055757", "075357", "061116", "075553", "071317", "011317", "075116", "055755", "072227", "032227", "055355", "071111", "055577", "055553", "035556", "011757", "063552", "055357", "034716", "022227", "065555", "027555", "077555", "055255", "074755", "071247", "062326", "022222", "032623", "001740"]
+
+const shellPixels = (() => {
+  const bin = atob(SHELL_B64)
+  const out = new Uint8Array(77 * PNG_W * 3)
+  let i = 0
+  for (let k = 0; k < bin.length; k += 4) {
+    const n = bin.charCodeAt(k)
+    for (let j = 0; j < n; j++) {
+      out[i * 3] = bin.charCodeAt(k + 1)
+      out[i * 3 + 1] = bin.charCodeAt(k + 2)
+      out[i * 3 + 2] = bin.charCodeAt(k + 3)
+      i++
+    }
+  }
+  return out
+})()
+
+const drawText = (px, str, x, y, color) => {
+  for (const ch of String(str).toUpperCase()) {
+    const code = ch.charCodeAt(0)
+    if (code >= 32 && code <= 126) {
+      const bits = parseInt(FONT[code - 32], 16)
+      for (let py = 0; py < 6; py++) {
+        for (let cxi = 0; cxi < 4; cxi++) {
+          if (bits & (1 << (py * 4 + cxi))) {
+            const o = ((y + py) * PNG_W + x + cxi) * 4
+            px[o] = color[0] & ~3
+            px[o + 1] = color[1] & ~3
+            px[o + 2] = color[2] & ~3
+          }
+        }
+      }
+    }
+    x += 4
+  }
+}
+
+const SILENT_FRAME = [0x41, 0x42, 0x43, 0x44]
+
+const emptyCart = (code = "") => {
+  const cart = {
+    version: VERSION,
+    code,
+    gfx: new Uint8Array(SIZE.gfx),
+    map: new Uint8Array(SIZE.map),
+    gff: new Uint8Array(SIZE.gff),
+    music: new Uint8Array(SIZE.music),
+    sfx: new Uint8Array(SIZE.sfx),
+    label: newLabel(),
+    codeInfo: null,
+    warning: null,
+  }
+  for (let i = 0; i < 64; i++) cart.music.set(SILENT_FRAME, i * 4)
+  for (let i = 0; i < 64; i++) cart.sfx[i * 68 + 65] = i === 0 ? 1 : 16
+  return cart
+}
+
+const sfxNote = (sfx, pattern, note) => {
+  const lsb = sfx[pattern * 68 + note * 2]
+  const msb = sfx[pattern * 68 + note * 2 + 1]
+  return {
+    pitch: lsb & 63,
+    waveform: ((msb & 0x80) >> 4) | ((msb & 0x01) << 2) | ((lsb & 0xc0) >> 6),
+    volume: (msb & 0x0e) >> 1,
+    effect: (msb & 0x70) >> 4,
+  }
+}
+
+const setSfxNote = (sfx, pattern, note, { pitch = 0, waveform = 0, volume = 0, effect = 0 } = {}) => {
+  const base = pattern * 68 + note * 2
+  sfx[base] = (pitch & 63) | ((waveform & 3) << 6)
+  sfx[base + 1] = ((waveform & 8) << 4) | ((waveform & 4) >> 2) | (effect << 4) | (volume << 1)
+}
+
+const sfxProps = (sfx, pattern) => ({
+  mode: sfx[pattern * 68 + 64],
+  duration: sfx[pattern * 68 + 65],
+  loopStart: sfx[pattern * 68 + 66],
+  loopEnd: sfx[pattern * 68 + 67],
+})
+
+const cartToPicoData = cart => {
+  const d = new Uint8Array(0x8020)
+  d.set(cart.gfx, OFF.gfx)
+  d.set(cart.map, OFF.map)
+  d.set(cart.gff, OFF.gff)
+  d.set(cart.music, OFF.music)
+  d.set(cart.sfx, OFF.sfx)
+  d.set(codeToRegion(cart.code), OFF.code)
+  d[OFF.version] = cart.version || VERSION
+  d[0x8001] = 0
+  d[0x8002] = 2
+  d[0x8003] = 3
+  d[0x8004] = 0x77
+  d[0x8005] = 0
+  d.set(sha1(d.subarray(0, 0x8000)), 0x8006)
+  return d
+}
+
+const picoDataToCart = pd => {
+  const cart = emptyCart("")
+  cart.gfx = pd.slice(OFF.gfx, OFF.gfx + SIZE.gfx)
+  cart.map = pd.slice(OFF.map, OFF.map + SIZE.map)
+  cart.gff = pd.slice(OFF.gff, OFF.gff + SIZE.gff)
+  cart.music = pd.slice(OFF.music, OFF.music + SIZE.music)
+  cart.sfx = pd.slice(OFF.sfx, OFF.sfx + SIZE.sfx)
+  const res = codeFromRegion(pd.subarray(OFF.code, OFF.code + SIZE.code))
+  cart.code = res.code.replace(/\r/g, " ")
+  cart.codeInfo = res
+  cart.version = pd[OFF.version]
+  if (pd.length >= 0x801a) {
+    const stored = pd.subarray(0x8006, 0x801a)
+    let hasHash = false
+    for (let i = 0; i < 20; i++) if (stored[i]) { hasHash = true; break }
+    if (hasHash) {
+      const calc = sha1(pd.subarray(0, 0x8000))
+      let match = true
+      for (let i = 0; i < 20; i++) if (calc[i] !== stored[i]) { match = false; break }
+      if (!match) cart.warning = "cart integrity hash mismatch"
+    }
+  }
+  return cart
+}
+
+const pngToPicoData = img => {
+  if (img.w !== PNG_W || img.h < PNG_H) throw new Error(`expected a 160x205+ png, got ${img.w}x${img.h}`)
+  const pd = new Uint8Array(0x8020)
+  const count = Math.min(0x8020, img.w * img.h)
+  for (let i = 0; i < count; i++) {
+    const o = i * 4
+    pd[i] = ((img.pixels[o] & 3) << 4) | ((img.pixels[o + 1] & 3) << 2) | (img.pixels[o + 2] & 3) | ((img.pixels[o + 3] & 3) << 6)
+  }
+  return pd
+}
+
+const encodeCart = cart => {
+  const pd = cartToPicoData(cart)
+  const px = new Uint8Array(PNG_W * PNG_H * 4)
+  for (let i = 0; i < PNG_W * PNG_H; i++) px[i * 4 + 3] = 252
+  for (let i = 0; i < shellPixels.length; i++) {
+    const p = i < 24 * PNG_W ? i : i + 128 * PNG_W
+    const o = p * 4
+    px[o] = shellPixels[i * 3]
+    px[o + 1] = shellPixels[i * 3 + 1]
+    px[o + 2] = shellPixels[i * 3 + 2]
+  }
+  const label = cart.label ?? newLabel()
+  for (let y = 0; y < 128; y++) {
+    const py = y + LABEL_Y
+    for (let x = 1; x < 15; x++) {
+      const o = (py * PNG_W + x) * 4
+      px[o] = SHELL_GRAY[0]
+      px[o + 1] = SHELL_GRAY[1]
+      px[o + 2] = SHELL_GRAY[2]
+    }
+    for (let x = 145; x < 159; x++) {
+      const o = (py * PNG_W + x) * 4
+      px[o] = SHELL_GRAY[0]
+      px[o + 1] = SHELL_GRAY[1]
+      px[o + 2] = SHELL_GRAY[2]
+    }
+    for (const x of [0, 15, 144, 159]) {
+      const o = (py * PNG_W + x) * 4
+      px[o] = FRAME_BLACK[0]
+      px[o + 1] = FRAME_BLACK[1]
+      px[o + 2] = FRAME_BLACK[2]
+    }
+    for (let x = 16; x < 144; x++) {
+      const c = PALETTE[labelGet(label, x, y)]
+      const o = (py * PNG_W + x) * 4
+      px[o] = c[0] & ~3
+      px[o + 1] = c[1] & ~3
+      px[o + 2] = c[2] & ~3
+    }
+  }
+  const title = cart.title ?? []
+  drawText(px, title[0] ?? "", 18, 167, TITLE_WHITE)
+  drawText(px, title[1] ?? "", 18, 173, TITLE_WHITE)
+  for (let y = 0; y < PNG_H; y++) {
+    for (let x = 0; x < PNG_W; x++) {
+      if (transparent(x, y)) {
+        const o = (y * PNG_W + x) * 4
+        px[o] &= 3
+        px[o + 1] &= 3
+        px[o + 2] &= 3
+        px[o + 3] &= 3
+      }
+    }
+  }
+  for (let i = 0; i < pd.length; i++) {
+    const o = i * 4
+    const b = pd[i]
+    px[o] |= (b >> 4) & 3
+    px[o + 1] |= (b >> 2) & 3
+    px[o + 2] |= b & 3
+    px[o + 3] |= (b >> 6) & 3
+  }
+  return encodePng(px, PNG_W, PNG_H)
+}
+
+const extractLabel = img => {
+  const lab = newLabel()
+  for (let y = 0; y < 128; y++) {
+    for (let x = 0; x < PNG_W; x++) {
+      const o = ((y + LABEL_Y) * img.w + x) * 4
+      labelSet(lab, x, y, nearestPalette(img.pixels[o], img.pixels[o + 1], img.pixels[o + 2]))
+    }
+  }
+  return lab
+}
+
+const decodeCart = async bytes => {
+  const img = await decodePng(bytes)
+  const cart = picoDataToCart(pngToPicoData(img))
+  cart.label = extractLabel(img)
+  return cart
+}
+
+globalThis.P8 = {
+  PALETTE, OFF, SIZE, PNG_W, PNG_H, VERSION,
+  emptyCart, encodeCart, decodeCart,
+  encodePng, decodePng, cartToPicoData, picoDataToCart, pngToPicoData,
+  codeToRegion, codeFromRegion, pxaCompress, pxaDecompress, sha1,
+  strToBytes, bytesToStr,
+  newLabel, labelGet, labelSet, nearestPalette,
+  sfxNote, setSfxNote, sfxProps,
+}
+
+const frame = document.getElementById("player")
+const cartImg = document.getElementById("cart")
+const gfxImg = document.getElementById("gfx")
+const mapImg = document.getElementById("map")
+const codeEl = document.getElementById("code")
+const fileEl = document.getElementById("file")
+const ppBtn = document.getElementById("pp")
+const muteBtn = document.getElementById("mute")
+const fsBtn = document.getElementById("fs")
+
+const bytesToB64 = bytes => {
+  let s = ""
+  for (const b of bytes) s += String.fromCharCode(b)
+  return btoa(s)
+}
+
+const bootDoc = png => {
+  const zeros = Array(40).fill("0").join(",")
+  return "<!doctype html><html><head><meta charset=\"utf-8\">"
+    + "<style>html,body{margin:0;padding:0;overflow:hidden;background:#000;width:100%;height:100%}body{display:flex;align-items:center;justify-content:center}canvas{width:256px;height:256px;image-rendering:pixelated}</style>"
+    + "</head><body>"
+    + "<canvas id=\"canvas\" width=\"512\" height=\"512\" oncontextmenu=\"return false\"></canvas>"
+    + "<script>var Module;var playable_area_count=0;var playarea_state=0;var codo_command=0;var codo_command_p=0;var codo_volume=256;var codo_running=true;var pa_pid=[" + zeros + "];"
+    + "Module={arguments:[\"cart.p8.png\"],canvas:document.getElementById(\"canvas\")};"
+    + "Module.preRun=[function(){"
+    + "var bin=atob(\"" + bytesToB64(png) + "\");var b=new Uint8Array(bin.length);for(var i=0;i<bin.length;i++)b[i]=bin.charCodeAt(i);"
+    + "var orig=Module.readAsync;"
+    + "Module.readAsync=function(url,onload,onerror){"
+    + "if(/\\.p8\\.png$/i.test(url)){setTimeout(function(){onload(b.buffer)},30);return}"
+    + "if(orig)return orig(url,onload,onerror)"
+    + "};"
+    + "}];<\/script>"
+    + "<script src=\"https://www.lexaloffle.com/play/pico8_0207.js\"><\/script>"
+    + "<script>document.addEventListener(\"pointerdown\",function(){var a=window.pico8_audio_context;if(a&&a.state===\"suspended\")a.resume()},true);document.addEventListener(\"keydown\",function(e){if(e.key.indexOf(\"Arrow\")==0||e.key==\" \")e.preventDefault()})<\/script>"
+    + "</body></html>"
+}
+
+const bootPlayer = png => {
+  frame.srcdoc = bootDoc(png)
+}
+
+let currentLabel = P8.newLabel()
+let baseCart = null
+
+const titleLines = code => {
+  const out = []
+  for (const line of code.split("\n")) {
+    const m = line.match(/^\s*--\s?(.*?)\s*$/)
+    if (m && m[1]) out.push(m[1])
+    if (out.length === 2) break
+  }
+  return out
+}
+
+const buildCart = () => {
+  const cart = P8.emptyCart(codeEl.value)
+  if (baseCart) {
+    cart.gfx = baseCart.gfx
+    cart.map = baseCart.map
+    cart.gff = baseCart.gff
+    cart.music = baseCart.music
+    cart.sfx = baseCart.sfx
+  }
+  cart.label = currentLabel
+  cart.title = titleLines(codeEl.value)
+  return cart
+}
+
+const setImg = (img, png) => {
+  if (img.src.startsWith("blob:")) URL.revokeObjectURL(img.src)
+  img.src = URL.createObjectURL(new Blob([png], { type: "image/png" }))
+}
+
+const refresh = () => {
+  const png = P8.encodeCart(buildCart())
+  setImg(cartImg, png)
+  return png
+}
+
+const sheetPixels = gfx => {
+  const px = new Uint8Array(128 * 128 * 4)
+  for (let i = 0; i < 8192; i++) {
+    const a = PALETTE[gfx[i] & 15]
+    const b = PALETTE[gfx[i] >> 4]
+    const o = ((i >> 6) * 128 + (i % 64) * 2) * 4
+    px[o] = a[0]
+    px[o + 1] = a[1]
+    px[o + 2] = a[2]
+    px[o + 3] = 255
+    px[o + 4] = b[0]
+    px[o + 5] = b[1]
+    px[o + 6] = b[2]
+    px[o + 7] = 255
+  }
+  return px
+}
+
+const mapPixels = (gfx, map) => {
+  const px = new Uint8Array(1024 * 512 * 4)
+  const blit = (tx, ty, sx, sy) => {
+    for (let py = 0; py < 8; py++) {
+      for (let pxl = 0; pxl < 8; pxl++) {
+        const byte = gfx[(sy + py) * 64 + ((sx + pxl) >> 1)]
+        const c = PALETTE[(sx + pxl) & 1 ? byte >> 4 : byte & 15]
+        const o = ((ty * 8 + py) * 1024 + tx * 8 + pxl) * 4
+        px[o] = c[0]
+        px[o + 1] = c[1]
+        px[o + 2] = c[2]
+        px[o + 3] = 255
+      }
+    }
+  }
+  for (let ty = 0; ty < 32; ty++) for (let tx = 0; tx < 128; tx++) blit(tx, ty, tx * 8, 64 + ty * 8)
+  for (let ty = 32; ty < 64; ty++) for (let tx = 0; tx < 128; tx++) {
+    const t = map[(ty - 32) * 128 + tx]
+    blit(tx, ty, (t & 15) * 8, (t >> 4) * 8)
+  }
+  return px
+}
+
+const renderSheets = cart => {
+  setImg(gfxImg, P8.encodePng(sheetPixels(cart.gfx), 128, 128))
+  setImg(mapImg, P8.encodePng(mapPixels(cart.gfx, cart.map), 1024, 512))
+}
+
+const grabLabel = () => {
+  try {
+    const cv = frame.contentWindow && frame.contentWindow.document.getElementById("canvas")
+    if (!cv) return
+    const t = document.createElement("canvas")
+    t.width = 128
+    t.height = 128
+    const g = t.getContext("2d")
+    g.imageSmoothingEnabled = false
+    g.drawImage(cv, 0, 0, 128, 128)
+    const d = g.getImageData(0, 0, 128, 128).data
+    for (let y = 0; y < 128; y++) {
+      for (let x = 0; x < 128; x++) {
+        const o = (y * 128 + x) * 4
+        P8.labelSet(currentLabel, 16 + x, y, P8.nearestPalette(d[o], d[o + 1], d[o + 2]))
+      }
+    }
+  } catch (e) {}
+}
+
+const runCart = () => {
+  bootPlayer(refresh())
+}
+
+let paused = false
+let muted = false
+
+const toGame = () => { try { frame.focus() } catch (e) {} }
+const syncControls = () => {
+  paused = false
+  muted = false
+  ppBtn.textContent = "pause"
+  muteBtn.textContent = "mute"
+}
+
+document.getElementById("run").onclick = () => {
+  runCart()
+  syncControls()
+  toGame()
+}
+
+ppBtn.onclick = () => {
+  try { frame.contentWindow.Module.pico8TogglePaused() } catch (e) {}
+  paused = !paused
+  ppBtn.textContent = paused ? "play" : "pause"
+  toGame()
+}
+
+muteBtn.onclick = () => {
+  try { frame.contentWindow.Module.pico8ToggleSound() } catch (e) {}
+  muted = !muted
+  muteBtn.textContent = muted ? "unmute" : "mute"
+  toGame()
+}
+
+document.getElementById("reset").onclick = () => {
+  try { frame.contentWindow.Module.pico8Reset() } catch (e) {}
+  paused = false
+  ppBtn.textContent = "pause"
+  toGame()
+}
+
+fsBtn.onclick = () => {
+  if (document.fullscreenElement) document.exitFullscreen()
+  else {
+    frame.requestFullscreen()
+    toGame()
+  }
+}
+
+document.addEventListener("fullscreenchange", () => {
+  const w = frame.contentWindow
+  const cv = w && w.document.getElementById("canvas")
+  if (!cv) return
+  if (document.fullscreenElement === frame) {
+    const s = Math.max(1, Math.floor(Math.min(w.innerWidth, w.innerHeight) / 128))
+    cv.style.width = s * 128 + "px"
+    cv.style.height = s * 128 + "px"
+  } else {
+    cv.style.width = "256px"
+    cv.style.height = "256px"
+  }
+})
+
+document.getElementById("cap").onclick = () => {
+  grabLabel()
+  refresh()
+}
+
+document.getElementById("save").onclick = async () => {
+  const png = refresh()
+  if (window.showSaveFilePicker) {
+    const handle = await window.showSaveFilePicker({
+      suggestedName: "cart.p8.png",
+      types: [{ description: "p8 png cart", accept: { "image/png": [".png"] } }],
+    })
+    const writable = await handle.createWritable()
+    await writable.write(png)
+    await writable.close()
+  } else {
+    const link = document.createElement("a")
+    link.href = URL.createObjectURL(new Blob([png], { type: "image/png" }))
+    link.download = "cart.p8.png"
+    link.click()
+    URL.revokeObjectURL(link.href)
+  }
+}
+
+const openCart = async bytes => {
+  const cart = await P8.decodeCart(bytes)
+  codeEl.value = cart.code
+  currentLabel = cart.label
+  baseCart = cart
+  renderSheets(cart)
+  bootPlayer(refresh())
+  syncControls()
+}
+
+document.getElementById("load").onclick = async () => {
+  if (window.showOpenFilePicker) {
+    const [handle] = await window.showOpenFilePicker({
+      types: [{ description: "p8 png cart", accept: { "image/png": [".png"] } }],
+    })
+    openCart(new Uint8Array(await (await handle.getFile()).arrayBuffer()))
+  } else {
+    fileEl.onchange = async () => openCart(new Uint8Array(await fileEl.files[0].arrayBuffer()))
+    fileEl.click()
+  }
+}
+
+codeEl.value = `-- hello world
+
+t = 0
+
+function _update()
+  t += 1
+end
+
+function _draw()
+  cls(1)
+  print("hello world", 42, 56, 7)
+  print("frame " .. t, 46, 72, 6)
+end
+`
+;(() => {
+  renderSheets(P8.emptyCart(""))
+  runCart()
+})()
+</script>
+</body>
+</html>
